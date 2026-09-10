@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB vendor filters for Canon LBP + legacy SNBC label VIDs. -->
+<resources>
+    <!-- Canon Inc. (imageCLASS LBP6030B = VID 04A9 / PID 2795) -->
+    <usb-device vendor-id="1193" />
+    <usb-device vendor-id="1193" product-id="10133" />
+    <!-- Legacy SNBC OEM VIDs (label printers) -->
+    <usb-device vendor-id="5455" />
+    <usb-device vendor-id="2727" />
+    <usb-device vendor-id="10109" />
+    <usb-device vendor-id="1008" />
+</resources>

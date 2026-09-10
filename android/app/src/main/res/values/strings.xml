@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FatFox Driver</string>
+    <string name="print_service_label">FatFox Driver Service</string>
+    <string name="usb_permission_title">USB printer permission</string>
+</resources>
