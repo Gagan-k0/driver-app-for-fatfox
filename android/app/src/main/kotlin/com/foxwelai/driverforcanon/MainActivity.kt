@@ -66,9 +66,9 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         loadPersistedSettings()
         try {
-            com.foxwelai.driverforcanon.server.LocalHttpServer.get(applicationContext).start()
+            com.foxwelai.driverforcanon.server.PrintFoxServerService.startServer(applicationContext)
         } catch (e: Exception) {
-            Log.e(TAG, "Could not start local HTTP server", e)
+            Log.e(TAG, "Could not start PrintFoxServerService", e)
         }
 
         usbPrinter.onDeviceChanged = {
@@ -275,6 +275,7 @@ class MainActivity : FlutterActivity() {
                                 .putInt("threshold", call.argument<Int>("threshold") ?: 160)
                                 .putString("print_format", format)
                                 .putString("transport", preferredTransport)
+                                .putString("preferredTransport", preferredTransport)
                                 .putString("sheet_size", call.argument<String>("sheetSize") ?: "a4")
                                 .putInt("sheet_rows", call.argument<Int>("rows") ?: 4)
                                 .putInt("sheet_columns", call.argument<Int>("columns") ?: 2)
@@ -289,8 +290,11 @@ class MainActivity : FlutterActivity() {
                                 .putInt("wifi_port", wifiPrinter.port)
                                 .putBoolean("wifi_use_gdi", wifiPrinter.useGdi)
                                 .putBoolean("auto_cut", autoCut)
+                                .putBoolean("autoCut", autoCut)
                                 .putString("receipt_bt_address", receiptBtAddress)
+                                .putString("receiptBtAddress", receiptBtAddress)
                                 .putString("label_bt_address", labelBtAddress)
+                                .putString("labelBtAddress", labelBtAddress)
                                 .putInt("paper_settings_version", PAPER_SETTINGS_VERSION)
                                 .apply()
                             result.success(mapOf("ok" to true))
@@ -497,24 +501,31 @@ class MainActivity : FlutterActivity() {
 
     private fun loadPersistedSettings() {
         val prefs = getSharedPreferences("printfox_settings", MODE_PRIVATE)
-        preferredTransport = prefs.getString("transport", "bluetooth") ?: "bluetooth"
+        preferredTransport = prefs.getString("preferredTransport", null)
+            ?: prefs.getString("transport", "bluetooth") ?: "bluetooth"
         wifiPrinter.host = prefs.getString("wifi_host", "") ?: ""
         wifiPrinter.port = prefs.getInt("wifi_port", 9100)
         wifiPrinter.useGdi = prefs.getBoolean("wifi_use_gdi", true)
-        autoCut = prefs.getBoolean("auto_cut", true)
-        receiptBtAddress = prefs.getString("receipt_bt_address", "") ?: ""
-        labelBtAddress = prefs.getString("label_bt_address", "") ?: ""
+        autoCut = if (prefs.contains("autoCut")) prefs.getBoolean("autoCut", true) else prefs.getBoolean("auto_cut", true)
+        receiptBtAddress = prefs.getString("receiptBtAddress", null)
+            ?: prefs.getString("receipt_bt_address", "") ?: ""
+        labelBtAddress = prefs.getString("labelBtAddress", null)
+            ?: prefs.getString("label_bt_address", "") ?: ""
     }
 
     private fun persistTransportPrefs() {
         getSharedPreferences("printfox_settings", MODE_PRIVATE).edit()
             .putString("transport", preferredTransport)
+            .putString("preferredTransport", preferredTransport)
             .putString("wifi_host", wifiPrinter.host)
             .putInt("wifi_port", wifiPrinter.port)
             .putBoolean("wifi_use_gdi", wifiPrinter.useGdi)
             .putBoolean("auto_cut", autoCut)
+            .putBoolean("autoCut", autoCut)
             .putString("receipt_bt_address", receiptBtAddress)
+            .putString("receiptBtAddress", receiptBtAddress)
             .putString("label_bt_address", labelBtAddress)
+            .putString("labelBtAddress", labelBtAddress)
             .apply()
     }
 
@@ -1166,7 +1177,28 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            com.foxwelai.driverforcanon.server.LocalHttpServer.get(applicationContext).start()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not start local HTTP server in onCreate", e)
+        }
+        checkAndRequestBluetoothPermissions()
         handleIncomingIntent(intent)
+    }
+
+    private fun checkAndRequestBluetoothPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val perms = arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_SCAN
+            )
+            val missing = perms.filter {
+                ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isNotEmpty()) {
+                ActivityCompat.requestPermissions(this, missing.toTypedArray(), BT_PERM_REQ)
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {

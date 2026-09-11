@@ -56,11 +56,14 @@ class TransparentPrintActivity : Activity() {
         }
 
         val prefs = getSharedPreferences("printfox_settings", MODE_PRIVATE)
-        val preferredTransport = prefs.getString("preferredTransport", "bluetooth") ?: "bluetooth"
-        val receiptBtAddress = prefs.getString("receiptBtAddress", "") ?: ""
-        val labelBtAddress = prefs.getString("labelBtAddress", "") ?: ""
+        val preferredTransport = prefs.getString("preferredTransport", null)
+            ?: prefs.getString("transport", "bluetooth") ?: "bluetooth"
+        val receiptBtAddress = prefs.getString("receiptBtAddress", null)
+            ?: prefs.getString("receipt_bt_address", "") ?: ""
+        val labelBtAddress = prefs.getString("labelBtAddress", null)
+            ?: prefs.getString("label_bt_address", "") ?: ""
         val threshold = prefs.getInt("threshold", 160)
-        val autoCut = prefs.getBoolean("autoCut", true)
+        val autoCut = if (prefs.contains("autoCut")) prefs.getBoolean("autoCut", true) else prefs.getBoolean("auto_cut", true)
 
         // Safety finish timer in case network/rendering times out (6 seconds)
         finishRunnable = Runnable {

@@ -34,6 +34,7 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
 
     private val btHub by lazy { BluetoothPrinterHub.get(context) }
     private val usbPrinter by lazy { UsbPrinterHolder.get(context) }
+    private val wifiPrinter by lazy { com.foxwelai.driverforcanon.net.WifiPrinterClient() }
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var serverSocket: ServerSocket? = null
@@ -42,19 +43,29 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
 
     @Synchronized
     fun start() {
-        if (isRunning) return
+        if (isRunning && serverSocket != null && serverSocket?.isClosed == false) return
         isRunning = true
         Thread {
-            try {
-                serverSocket = ServerSocket(port)
-                Log.i(TAG, "Local Print HTTP Server started on port $port")
-                while (isRunning) {
-                    val clientSocket = serverSocket?.accept() ?: break
-                    Thread { handleClient(clientSocket) }.start()
+            var attempt = 0
+            while (isRunning && attempt < 5) {
+                try {
+                    val ss = ServerSocket()
+                    ss.reuseAddress = true
+                    ss.bind(java.net.InetSocketAddress(java.net.InetAddress.getByName("127.0.0.1"), port))
+                    serverSocket = ss
+                    Log.i(TAG, "Local Print HTTP Server started successfully on port $port (loopback 127.0.0.1)")
+                    while (isRunning && !ss.isClosed) {
+                        val clientSocket = ss.accept()
+                        Thread { handleClient(clientSocket) }.start()
+                    }
+                    break
+                } catch (e: Exception) {
+                    attempt++
+                    Log.e(TAG, "Server socket error on port $port (attempt $attempt/5)", e)
+                    try { Thread.sleep(500) } catch (_: Exception) {}
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Server error on port $port", e)
-            } finally {
+            }
+            if (attempt >= 5) {
                 isRunning = false
             }
         }.start()
@@ -183,11 +194,16 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
         mainHandler.post {
             try {
                 val prefs = context.getSharedPreferences("printfox_settings", Context.MODE_PRIVATE)
-                val preferredTransport = prefs.getString("preferredTransport", "bluetooth") ?: "bluetooth"
-                val receiptBtAddress = prefs.getString("receiptBtAddress", "") ?: ""
-                val labelBtAddress = prefs.getString("labelBtAddress", "") ?: ""
+                val preferredTransport = prefs.getString("preferredTransport", null)
+                    ?: prefs.getString("transport", "bluetooth") ?: "bluetooth"
+                val receiptBtAddress = prefs.getString("receiptBtAddress", null)
+                    ?: prefs.getString("receipt_bt_address", "") ?: ""
+                val labelBtAddress = prefs.getString("labelBtAddress", null)
+                    ?: prefs.getString("label_bt_address", "") ?: ""
+                val wifiHost = prefs.getString("wifi_host", "") ?: ""
+                val wifiPort = prefs.getInt("wifi_port", 9100)
                 val threshold = prefs.getInt("threshold", 160)
-                val autoCut = prefs.getBoolean("autoCut", true)
+                val autoCut = if (prefs.contains("autoCut")) prefs.getBoolean("autoCut", true) else prefs.getBoolean("auto_cut", true)
 
                 val themedContext = android.view.ContextThemeWrapper(context.applicationContext, android.R.style.Theme_DeviceDefault)
                 val webView = android.webkit.WebView(themedContext)
@@ -230,7 +246,17 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
 
                                         Thread {
                                             try {
-                                                sendBitmapToPrinterDirect(cropped, format, preferredTransport, receiptBtAddress, labelAddr = labelBtAddress, threshold = threshold, autoCut = autoCut)
+                                                sendBitmapToPrinterDirect(
+                                                    bitmap = cropped,
+                                                    format = format,
+                                                    transport = preferredTransport,
+                                                    receiptAddr = receiptBtAddress,
+                                                    labelAddr = labelBtAddress,
+                                                    wifiHost = wifiHost,
+                                                    wifiPort = wifiPort,
+                                                    threshold = threshold,
+                                                    autoCut = autoCut
+                                                )
                                             } finally {
                                                 if (cropped !== rawBitmap) rawBitmap.recycle()
                                                 rawBitmap.recycle()
@@ -259,67 +285,108 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
         transport: String,
         receiptAddr: String,
         labelAddr: String,
+        wifiHost: String,
+        wifiPort: Int,
         threshold: Int,
         autoCut: Boolean
     ) {
-        val role = if (format == "bill" || format == "label") BluetoothPrinterHub.ROLE_LABEL else BluetoothPrinterHub.ROLE_RECEIPT
-        val targetRole = if (role == BluetoothPrinterHub.ROLE_LABEL && btHub.isRoleConnected(BluetoothPrinterHub.ROLE_LABEL)) {
-            BluetoothPrinterHub.ROLE_LABEL
-        } else {
-            BluetoothPrinterHub.ROLE_RECEIPT
-        }
-
-        val preferredAddr = if (targetRole == BluetoothPrinterHub.ROLE_LABEL && labelAddr.isNotBlank()) labelAddr else receiptAddr
+        val cleanTransport = transport.trim().lowercase()
         val escJob = EscPosEncoder.printBitmapJob(bitmap, RECEIPT_80MM_WIDTH_DOTS, threshold, autoCut)
-
-        val addressesToTry = mutableListOf<String>()
-        if (preferredAddr.isNotBlank()) addressesToTry.add(preferredAddr)
-
-        val bonded = btHub.listBondedPrinters()
-        for (b in bonded) {
-            val bAddr = b["address"]?.toString() ?: ""
-            if (bAddr.isNotBlank() && !addressesToTry.contains(bAddr)) {
-                addressesToTry.add(bAddr)
-            }
-        }
-
-        Log.i(TAG, "Background server sending ESC/POS bitmap job (${escJob.size} bytes), candidate devices: $addressesToTry")
         var printed = false
 
-        for (targetAddr in addressesToTry) {
-            var connected = btHub.isRoleConnected(targetRole)
-            if (!connected) {
-                Log.i(TAG, "Connecting Bluetooth printer role=$targetRole to $targetAddr...")
-                val connRes = btHub.connect(targetRole, targetAddr)
-                connected = connRes["ok"] == true
-                if (!connected) {
-                    Log.w(TAG, "Could not connect to Bluetooth printer $targetAddr: ${connRes["error"]}")
-                    continue
-                }
-            }
+        Log.i(TAG, "sendBitmapToPrinterDirect: transport=$cleanTransport, format=$format, receiptAddr=$receiptAddr, labelAddr=$labelAddr, wifiHost=$wifiHost:$wifiPort")
 
-            var writeRes = btHub.write(targetRole, escJob)
-            if (writeRes["ok"] != true) {
-                Log.w(TAG, "Write attempt 1 failed to $targetAddr: ${writeRes["error"]}. Retrying in 100ms...")
-                try { Thread.sleep(100) } catch (_: Exception) {}
-                if (!btHub.isRoleConnected(targetRole)) {
-                    btHub.connect(targetRole, targetAddr)
+        if (cleanTransport == "wifi") {
+            if (wifiHost.isNotBlank()) {
+                wifiPrinter.host = wifiHost
+                wifiPrinter.port = wifiPort
+                Log.i(TAG, "Sending print job over Wi-Fi transport to $wifiHost:$wifiPort...")
+                val wifiRes = wifiPrinter.write(escJob)
+                if (wifiRes["ok"] == true) {
+                    printed = true
+                    Log.i(TAG, "Successfully printed via background HTTP server over Wi-Fi to $wifiHost:$wifiPort")
+                } else {
+                    Log.w(TAG, "Wi-Fi print failed to $wifiHost:$wifiPort: ${wifiRes["error"]}")
                 }
-                writeRes = btHub.write(targetRole, escJob)
-            }
-
-            if (writeRes["ok"] == true) {
-                printed = true
-                Log.i(TAG, "Successfully printed via background HTTP server to $targetAddr")
-                break
             } else {
-                Log.w(TAG, "Bluetooth write failed to $targetAddr after retry: ${writeRes["error"]}")
+                Log.w(TAG, "Wi-Fi transport requested but wifiHost is not configured")
+            }
+        } else if (cleanTransport == "usb") {
+            if (usbPrinter.isConnected() || usbPrinter.connect()["ok"] == true) {
+                val usbRes = usbPrinter.write(escJob)
+                if (usbRes["ok"] == true) {
+                    printed = true
+                    Log.i(TAG, "Successfully printed via background HTTP server over USB")
+                } else {
+                    Log.w(TAG, "USB write failed: ${usbRes["error"]}")
+                }
+            }
+        } else {
+            // Bluetooth transport (default)
+            val role = if (format == "bill" || format == "label") BluetoothPrinterHub.ROLE_LABEL else BluetoothPrinterHub.ROLE_RECEIPT
+            val targetRole = if (role == BluetoothPrinterHub.ROLE_LABEL && btHub.isRoleConnected(BluetoothPrinterHub.ROLE_LABEL)) {
+                BluetoothPrinterHub.ROLE_LABEL
+            } else {
+                BluetoothPrinterHub.ROLE_RECEIPT
+            }
+
+            val preferredAddr = if (targetRole == BluetoothPrinterHub.ROLE_LABEL && labelAddr.isNotBlank()) labelAddr else receiptAddr
+            val addressesToTry = mutableListOf<String>()
+            if (preferredAddr.isNotBlank()) {
+                addressesToTry.add(preferredAddr)
+            } else {
+                val bonded = btHub.listBondedPrinters()
+                for (b in bonded) {
+                    val bAddr = b["address"]?.toString() ?: ""
+                    if (bAddr.isNotBlank() && !addressesToTry.contains(bAddr)) {
+                        addressesToTry.add(bAddr)
+                    }
+                }
+            }
+
+            Log.i(TAG, "Background server sending Bluetooth ESC/POS bitmap job (${escJob.size} bytes), role=$targetRole, candidates=$addressesToTry")
+
+            for (targetAddr in addressesToTry) {
+                var connected = btHub.isRoleConnected(targetRole)
+                if (!connected) {
+                    Log.i(TAG, "Connecting Bluetooth printer role=$targetRole to $targetAddr...")
+                    val connRes = btHub.connect(targetRole, targetAddr)
+                    connected = connRes["ok"] == true
+                    if (!connected) {
+                        Log.w(TAG, "Could not connect to Bluetooth printer $targetAddr: ${connRes["error"]}")
+                        continue
+                    }
+                }
+
+                var writeRes = btHub.write(targetRole, escJob)
+                if (writeRes["ok"] != true) {
+                    Log.w(TAG, "Write attempt 1 failed to $targetAddr: ${writeRes["error"]}. Reconnecting and retrying...")
+                    try { Thread.sleep(100) } catch (_: Exception) {}
+                    btHub.disconnect(targetRole)
+                    val connRes = btHub.connect(targetRole, targetAddr)
+                    if (connRes["ok"] == true) {
+                        writeRes = btHub.write(targetRole, escJob)
+                    }
+                }
+
+                if (writeRes["ok"] == true) {
+                    printed = true
+                    Log.i(TAG, "Successfully printed via background HTTP server to $targetAddr")
+                    break
+                } else {
+                    Log.w(TAG, "Bluetooth write failed to $targetAddr after reconnect retry: ${writeRes["error"]}")
+                    btHub.disconnect(targetRole)
+                }
             }
         }
 
-        if (!printed) {
+        if (!printed && cleanTransport != "usb") {
+            Log.i(TAG, "Primary transport ($cleanTransport) failed. Checking USB fallback...")
             if (usbPrinter.isConnected() || usbPrinter.connect()["ok"] == true) {
-                usbPrinter.write(escJob)
+                val usbRes = usbPrinter.write(escJob)
+                if (usbRes["ok"] == true) {
+                    Log.i(TAG, "Successfully printed via USB fallback")
+                }
             }
         }
     }

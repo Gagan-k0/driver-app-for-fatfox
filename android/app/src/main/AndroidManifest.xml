@@ -5,6 +5,8 @@
 
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
 
     <!-- Bluetooth Classic printers (dual SPP: receipt + label) -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
@@ -72,6 +74,9 @@
             </intent-filter>
             <meta-data android:name="android.printservice" android:resource="@xml/print_service_config"/>
         </service>
+
+        <!-- Foreground Print HTTP Server Service -->
+        <service android:name=".server.PrintFoxServerService" android:exported="false" android:foregroundServiceType="connectedDevice"/>
 
         <meta-data android:name="flutterEmbedding" android:value="2"/>
     </application>
