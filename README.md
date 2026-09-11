@@ -51,8 +51,9 @@ An Android background driver and printing engine built with **Flutter** and **Ko
   ```
 - **`keepalive: true`**: Configured on the fetch call so Chrome **never cancels** the request during route transitions (e.g. KOT ➔ Bill ➔ Order screen).
 
-### **2. Embedded Local HTTP Server (`LocalHttpServer.kt`)**
-- Bound to `0.0.0.0:9123` with `reuseAddress = true` so it starts automatically on app launch (`onCreate`).
+### **2. Embedded Local HTTP Server (`LocalHttpServer.kt` & `PrintFoxServerService.kt`)**
+- Bound exclusively to loopback `127.0.0.1:9123` with `reuseAddress = true`.
+- Starts as a persistent Android **Foreground Service** (`PrintFoxServerService`) with an ongoing notification (`FatFox Print Server Active`), preventing MIUI / HyperOS / Android battery managers from killing the background server.
 - Implements Private Network Access (PNA) CORS headers:
   ```http
   Access-Control-Allow-Origin: *
