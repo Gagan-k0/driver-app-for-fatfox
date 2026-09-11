@@ -80,24 +80,33 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
         serverSocket = null
     }
 
+    private fun readHeaderLine(input: java.io.InputStream): String {
+        val baos = java.io.ByteArrayOutputStream()
+        var b: Int
+        while (input.read().also { b = it } != -1) {
+            if (b == '\n'.code) break
+            if (b != '\r'.code) baos.write(b)
+        }
+        return baos.toString("UTF-8")
+    }
+
     private fun handleClient(socket: Socket) {
         try {
             val input = socket.getInputStream()
-            val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
             val out = PrintWriter(socket.getOutputStream())
 
-            val requestLine = reader.readLine() ?: ""
+            val requestLine = readHeaderLine(input)
             if (requestLine.isEmpty()) {
                 socket.close()
                 return
             }
 
             var contentLength = 0
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                if (line.isNullOrEmpty()) break
-                if (line!!.lowercase().startsWith("content-length:")) {
-                    contentLength = line!!.substring(15).trim().toIntOrNull() ?: 0
+            while (true) {
+                val line = readHeaderLine(input)
+                if (line.isEmpty()) break
+                if (line.lowercase().startsWith("content-length:")) {
+                    contentLength = line.substring(15).trim().toIntOrNull() ?: 0
                 }
             }
 
@@ -114,17 +123,21 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 return
             }
 
-            var bodyStr = ""
+            var bodyBytes = ByteArray(0)
             if (contentLength > 0) {
-                val charBuffer = CharArray(contentLength)
-                var readTotal = 0
-                while (readTotal < contentLength) {
-                    val count = reader.read(charBuffer, readTotal, contentLength - readTotal)
+                bodyBytes = ByteArray(contentLength)
+                var bytesRead = 0
+                while (bytesRead < contentLength) {
+                    val count = input.read(bodyBytes, bytesRead, contentLength - bytesRead)
                     if (count == -1) break
-                    readTotal += count
+                    bytesRead += count
                 }
-                bodyStr = String(charBuffer, 0, readTotal)
+                if (bytesRead < contentLength) {
+                    Log.w(TAG, "Truncated body: got $bytesRead bytes, expected $contentLength")
+                    bodyBytes = bodyBytes.copyOf(bytesRead)
+                }
             }
+            val bodyStr = if (bodyBytes.isNotEmpty()) String(bodyBytes, Charsets.UTF_8) else ""
 
             if (requestLine.startsWith("POST")) {
                 var format = "kot"
@@ -193,6 +206,10 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
     private fun renderAndPrintBackground(htmlData: String, format: String, jobName: String) {
         mainHandler.post {
             try {
+                try {
+                    android.webkit.WebView.enableSlowWholeDocumentDraw()
+                } catch (_: Exception) {}
+
                 val prefs = context.getSharedPreferences("printfox_settings", Context.MODE_PRIVATE)
                 val preferredTransport = prefs.getString("preferredTransport", null)
                     ?: prefs.getString("transport", "bluetooth") ?: "bluetooth"
@@ -204,16 +221,25 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 val wifiPort = prefs.getInt("wifi_port", 9100)
                 val threshold = prefs.getInt("threshold", 160)
                 val autoCut = if (prefs.contains("autoCut")) prefs.getBoolean("autoCut", true) else prefs.getBoolean("auto_cut", true)
+                val targetWidth = RECEIPT_80MM_WIDTH_DOTS
 
                 val themedContext = android.view.ContextThemeWrapper(context.applicationContext, android.R.style.Theme_DeviceDefault)
+                val parent = android.widget.FrameLayout(themedContext)
                 val webView = android.webkit.WebView(themedContext)
+                webView.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
+                parent.addView(webView, android.view.ViewGroup.LayoutParams(targetWidth, android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
+
                 webView.settings.javaScriptEnabled = true
                 webView.settings.domStorageEnabled = true
                 webView.settings.loadWithOverviewMode = false
                 webView.settings.useWideViewPort = false
 
-                val targetWidth = RECEIPT_80MM_WIDTH_DOTS
-                webView.layout(0, 0, targetWidth, 2400)
+                val measureSpecW = android.view.View.MeasureSpec.makeMeasureSpec(targetWidth, android.view.View.MeasureSpec.EXACTLY)
+                val measureSpecH = android.view.View.MeasureSpec.makeMeasureSpec(8000, android.view.View.MeasureSpec.AT_MOST)
+                parent.measure(measureSpecW, measureSpecH)
+                parent.layout(0, 0, parent.measuredWidth, parent.measuredHeight)
+                webView.measure(measureSpecW, measureSpecH)
+                webView.layout(0, 0, webView.measuredWidth, webView.measuredHeight)
 
                 var captured = false
                 webView.webViewClient = object : android.webkit.WebViewClient() {
@@ -222,6 +248,47 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                         captured = true
 
                         mainHandler.postDelayed({
+                            try {
+                                val v = view ?: return@postDelayed
+                                val contentH = ((v.contentHeight * (v.scale ?: 1f)).toInt()).coerceIn(300, 4000)
+                                Log.i(TAG, "WebView onPageFinished capture: contentH=$contentH, scale=${v.scale}")
+
+                                val specW = android.view.View.MeasureSpec.makeMeasureSpec(targetWidth, android.view.View.MeasureSpec.EXACTLY)
+                                val specH = android.view.View.MeasureSpec.makeMeasureSpec(contentH, android.view.View.MeasureSpec.EXACTLY)
+                                parent.measure(specW, specH)
+                                parent.layout(0, 0, targetWidth, contentH)
+                                v.measure(specW, specH)
+                                v.layout(0, 0, targetWidth, contentH)
+
+                                val rawBitmap = Bitmap.createBitmap(targetWidth, contentH, Bitmap.Config.ARGB_8888)
+                                val canvas = android.graphics.Canvas(rawBitmap)
+                                canvas.drawColor(Color.WHITE)
+                                v.draw(canvas)
+
+                                val cropped = cropAndScaleReceiptBitmap(rawBitmap, targetWidth)
+
+                                Thread {
+                                    try {
+                                        sendBitmapToPrinterDirect(
+                                            bitmap = cropped,
+                                            format = format,
+                                            transport = preferredTransport,
+                                            receiptAddr = receiptBtAddress,
+                                            labelAddr = labelBtAddress,
+                                            wifiHost = wifiHost,
+                                            wifiPort = wifiPort,
+                                            threshold = threshold,
+                                            autoCut = autoCut
+                                        )
+                                    } finally {
+                                        if (cropped !== rawBitmap) rawBitmap.recycle()
+                                        rawBitmap.recycle()
+                                    }
+                                }.start()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Background WebView capture failed", e)
+                            }
+
                             try {
                                 view?.evaluateJavascript(
                                     "(function() { return document.body ? document.body.innerText : ''; })()"
@@ -232,44 +299,10 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                                         text.contains("Sign in to your account", ignoreCase = true)
                                     )) {
                                         Log.e(TAG, "Blocked login page text detected in background WebView output")
-                                        return@evaluateJavascript
-                                    }
-
-                                    try {
-                                        val contentH = ((view?.contentHeight ?: 800) * (view?.scale ?: 1f)).toInt().coerceIn(300, 4000)
-                                        val rawBitmap = Bitmap.createBitmap(targetWidth, contentH, Bitmap.Config.ARGB_8888)
-                                        val canvas = android.graphics.Canvas(rawBitmap)
-                                        canvas.drawColor(Color.WHITE)
-                                        view?.draw(canvas)
-
-                                        val cropped = cropAndScaleReceiptBitmap(rawBitmap, targetWidth)
-
-                                        Thread {
-                                            try {
-                                                sendBitmapToPrinterDirect(
-                                                    bitmap = cropped,
-                                                    format = format,
-                                                    transport = preferredTransport,
-                                                    receiptAddr = receiptBtAddress,
-                                                    labelAddr = labelBtAddress,
-                                                    wifiHost = wifiHost,
-                                                    wifiPort = wifiPort,
-                                                    threshold = threshold,
-                                                    autoCut = autoCut
-                                                )
-                                            } finally {
-                                                if (cropped !== rawBitmap) rawBitmap.recycle()
-                                                rawBitmap.recycle()
-                                            }
-                                        }.start()
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Background WebView capture failed", e)
                                     }
                                 }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Background WebView evaluateJavascript failed", e)
-                            }
-                        }, 400)
+                            } catch (_: Exception) {}
+                        }, 1000)
                     }
                 }
                 webView.loadDataWithBaseURL("https://staging.fatfox.testfox.in", htmlData, "text/html", "UTF-8", null)
@@ -295,6 +328,23 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
         var printed = false
 
         Log.i(TAG, "sendBitmapToPrinterDirect: transport=$cleanTransport, format=$format, receiptAddr=$receiptAddr, labelAddr=$labelAddr, wifiHost=$wifiHost:$wifiPort")
+
+        val needsBt = cleanTransport != "wifi" && cleanTransport != "usb"
+        if (needsBt && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val btPermOk = androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.BLUETOOTH_CONNECT
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!btPermOk) {
+                Log.e(TAG, "BLUETOOTH_CONNECT permission missing in server context. Cannot print via Bluetooth. Grant permission in app UI.")
+                if (usbPrinter.isConnected() || usbPrinter.connect()["ok"] == true) {
+                    val usbRes = usbPrinter.write(escJob)
+                    if (usbRes["ok"] == true) {
+                        Log.i(TAG, "Successfully printed via USB fallback due to missing BT permission")
+                    }
+                }
+                return
+            }
+        }
 
         if (cleanTransport == "wifi") {
             if (wifiHost.isNotBlank()) {
@@ -412,7 +462,10 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
             }
         }
 
-        if (maxY < minY) return src
+        if (maxY < minY) {
+            Log.w(TAG, "cropAndScaleReceiptBitmap: bitmap is ALL-WHITE (no dark pixels detected) - WebView render may be blank")
+            return src
+        }
 
         val padY = 8
         val cropY = (minY - padY).coerceAtLeast(0)
