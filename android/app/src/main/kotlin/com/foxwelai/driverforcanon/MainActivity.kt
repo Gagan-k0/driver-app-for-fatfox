@@ -1616,6 +1616,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         // Keep shared USB receivers alive for PrintService / process lifetime.
+        btHub.stopWatchdog()
         super.onDestroy()
     }
 }

@@ -21,6 +21,7 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
     companion object {
         private const val TAG = "LocalHttpServer"
         private const val RECEIPT_80MM_WIDTH_DOTS = EscPosEncoder.WIDTH_80MM_DOTS
+        const val WIDTH_58MM_DOTS = 384  // 384 px @ 203 DPI (58mm standard)
 
         @Volatile
         private var instance: LocalHttpServer? = null
@@ -40,6 +41,35 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
     private var serverSocket: ServerSocket? = null
     @Volatile
     private var isRunning = false
+
+    private data class QueuedJob(
+        val htmlData: String,
+        val format: String,
+        val jobName: String,
+        val paperWidth: String,
+        val kotAutoCut: Boolean
+    )
+    private val printQueue = java.util.concurrent.LinkedBlockingQueue<QueuedJob>()
+    private val workerRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun ensurePrintWorker() {
+        if (workerRunning.getAndSet(true)) return
+        Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            Log.i(TAG, "FIFO print worker started")
+            try {
+                while (isRunning) {
+                    val job = printQueue.take()
+                    try { renderAndPrintSync(job) }
+                    catch (t: Throwable) { Log.e(TAG, "FIFO job failed: ${job.jobName}", t) }
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                workerRunning.set(false)
+            }
+        }.start()
+    }
 
     @Synchronized
     fun start() {
@@ -166,7 +196,20 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 }
 
                 if (htmlData.isNotBlank()) {
-                    renderAndPrintBackground(htmlData, format, name)
+                    val postedPaper = try {
+                        val json2 = JSONObject(bodyStr)
+                        json2.optString("paperWidth", "80mm").trim().lowercase()
+                    } catch (_: Exception) { "80mm" }
+                    val paperWidth = if (postedPaper == "58mm") "58mm" else "80mm"
+
+                    val kotAutoCut = try {
+                        val json3 = JSONObject(bodyStr)
+                        if (json3.has("kotAutoCut")) json3.getBoolean("kotAutoCut") else true
+                    } catch (_: Exception) { true }
+
+                    ensurePrintWorker()
+                    printQueue.offer(QueuedJob(htmlData, format, name, paperWidth, kotAutoCut))
+                    Log.i(TAG, "Queued: format=$format, paper=$paperWidth, autoCut=$kotAutoCut, depth=${printQueue.size}")
                 }
 
                 val responseJson = JSONObject().put("success", true).put("message", "Print job spooled silently").toString()
@@ -203,7 +246,8 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
      * Render HTML in offscreen background WebView without launching ANY Activity or screen.
      * Prevents mobile screen from going black or locking when KOT/Bill is clicked in Chrome.
      */
-    private fun renderAndPrintBackground(htmlData: String, format: String, jobName: String) {
+    private fun renderAndPrintSync(job: QueuedJob) {
+        val latch = java.util.concurrent.CountDownLatch(1)
         mainHandler.post {
             try {
                 try {
@@ -220,8 +264,9 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 val wifiHost = prefs.getString("wifi_host", "") ?: ""
                 val wifiPort = prefs.getInt("wifi_port", 9100)
                 val threshold = prefs.getInt("threshold", 160)
-                val autoCut = if (prefs.contains("autoCut")) prefs.getBoolean("autoCut", true) else prefs.getBoolean("auto_cut", true)
-                val targetWidth = RECEIPT_80MM_WIDTH_DOTS
+                val prefsAutoCut = if (prefs.contains("autoCut")) prefs.getBoolean("autoCut", true) else prefs.getBoolean("auto_cut", true)
+                val autoCut = if (job.format == "kot") job.kotAutoCut else prefsAutoCut
+                val targetWidth = if (job.paperWidth == "58mm") WIDTH_58MM_DOTS else RECEIPT_80MM_WIDTH_DOTS
 
                 val themedContext = android.view.ContextThemeWrapper(context.applicationContext, android.R.style.Theme_DeviceDefault)
                 val parent = android.widget.FrameLayout(themedContext)
@@ -247,69 +292,88 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                         if (captured) return
                         captured = true
 
-                        mainHandler.postDelayed({
+                        Thread {
                             try {
-                                val v = view ?: return@postDelayed
-                                val contentH = ((v.contentHeight * (v.scale ?: 1f)).toInt()).coerceIn(300, 4000)
-                                Log.i(TAG, "WebView onPageFinished capture: contentH=$contentH, scale=${v.scale}")
-
-                                val specW = android.view.View.MeasureSpec.makeMeasureSpec(targetWidth, android.view.View.MeasureSpec.EXACTLY)
-                                val specH = android.view.View.MeasureSpec.makeMeasureSpec(contentH, android.view.View.MeasureSpec.EXACTLY)
-                                parent.measure(specW, specH)
-                                parent.layout(0, 0, targetWidth, contentH)
-                                v.measure(specW, specH)
-                                v.layout(0, 0, targetWidth, contentH)
-
-                                val rawBitmap = Bitmap.createBitmap(targetWidth, contentH, Bitmap.Config.ARGB_8888)
-                                val canvas = android.graphics.Canvas(rawBitmap)
-                                canvas.drawColor(Color.WHITE)
-                                v.draw(canvas)
-
-                                val cropped = cropAndScaleReceiptBitmap(rawBitmap, targetWidth)
-
-                                Thread {
-                                    try {
-                                        sendBitmapToPrinterDirect(
-                                            bitmap = cropped,
-                                            format = format,
-                                            transport = preferredTransport,
-                                            receiptAddr = receiptBtAddress,
-                                            labelAddr = labelBtAddress,
-                                            wifiHost = wifiHost,
-                                            wifiPort = wifiPort,
-                                            threshold = threshold,
-                                            autoCut = autoCut
-                                        )
-                                    } finally {
-                                        if (cropped !== rawBitmap) rawBitmap.recycle()
-                                        rawBitmap.recycle()
+                                var attempt = 0
+                                var rawBitmap: Bitmap? = null
+                                while (attempt < 5) {
+                                    Thread.sleep(400)
+                                    val contentH = ((view!!.contentHeight * (view.scale ?: 1f)).toInt()).coerceIn(300, 4000)
+                                    val specW = android.view.View.MeasureSpec.makeMeasureSpec(targetWidth, android.view.View.MeasureSpec.EXACTLY)
+                                    val specH = android.view.View.MeasureSpec.makeMeasureSpec(contentH, android.view.View.MeasureSpec.EXACTLY)
+                                    val bmp = Bitmap.createBitmap(targetWidth, contentH, Bitmap.Config.ARGB_8888)
+                                    var isBlank = true
+                                    
+                                    val syncLatch = java.util.concurrent.CountDownLatch(1)
+                                    mainHandler.post {
+                                        try {
+                                            parent.measure(specW, specH)
+                                            parent.layout(0, 0, targetWidth, contentH)
+                                            view.measure(specW, specH)
+                                            view.layout(0, 0, targetWidth, contentH)
+                                            
+                                            val canvas = android.graphics.Canvas(bmp)
+                                            canvas.drawColor(Color.WHITE)
+                                            view.draw(canvas)
+                                        } finally {
+                                            syncLatch.countDown()
+                                        }
                                     }
-                                }.start()
+                                    syncLatch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                                    
+                                    val checkH = contentH.coerceAtMost(200)
+                                    for (y in 0 until checkH step 2) {
+                                        for (x in 0 until targetWidth step 4) {
+                                            val c = bmp.getPixel(x, y)
+                                            val lum = (Color.red(c)*30 + Color.green(c)*59 + Color.blue(c)*11)/100
+                                            if (lum < threshold) {
+                                                isBlank = false
+                                                break
+                                            }
+                                        }
+                                        if (!isBlank) break
+                                    }
+                                    
+                                    if (isBlank && attempt < 4) {
+                                        bmp.recycle()
+                                        attempt++
+                                        continue
+                                    }
+                                    rawBitmap = bmp
+                                    break
+                                }
+                                
+                                if (rawBitmap != null) {
+                                    val cropped = cropAndScaleReceiptBitmap(rawBitmap, targetWidth, threshold)
+                                    sendBitmapToPrinterDirect(
+                                        bitmap = cropped,
+                                        format = job.format,
+                                        transport = preferredTransport,
+                                        receiptAddr = receiptBtAddress,
+                                        labelAddr = labelBtAddress,
+                                        wifiHost = wifiHost,
+                                        wifiPort = wifiPort,
+                                        threshold = threshold,
+                                        autoCut = autoCut
+                                    )
+                                    if (cropped !== rawBitmap) cropped.recycle()
+                                    rawBitmap.recycle()
+                                }
                             } catch (e: Exception) {
                                 Log.e(TAG, "Background WebView capture failed", e)
+                            } finally {
+                                latch.countDown()
                             }
-
-                            try {
-                                view?.evaluateJavascript(
-                                    "(function() { return document.body ? document.body.innerText : ''; })()"
-                                ) { text ->
-                                    if (text != null && (
-                                        text.contains("Welcome to FatFox", ignoreCase = true) ||
-                                        text.contains("Manage restaurant operations", ignoreCase = true) ||
-                                        text.contains("Sign in to your account", ignoreCase = true)
-                                    )) {
-                                        Log.e(TAG, "Blocked login page text detected in background WebView output")
-                                    }
-                                }
-                            } catch (_: Exception) {}
-                        }, 1000)
+                        }.start()
                     }
                 }
-                webView.loadDataWithBaseURL("https://staging.fatfox.testfox.in", htmlData, "text/html", "UTF-8", null)
+                webView.loadDataWithBaseURL("https://staging.fatfox.testfox.in", job.htmlData, "text/html", "UTF-8", null)
             } catch (e: Exception) {
                 Log.e(TAG, "Background WebView init error", e)
+                latch.countDown()
             }
         }
+        latch.await(15, java.util.concurrent.TimeUnit.SECONDS)
     }
 
     private fun sendBitmapToPrinterDirect(
@@ -324,7 +388,8 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
         autoCut: Boolean
     ) {
         val cleanTransport = transport.trim().lowercase()
-        val escJob = EscPosEncoder.printBitmapJob(bitmap, RECEIPT_80MM_WIDTH_DOTS, threshold, autoCut)
+        val rollWidth = if (bitmap.width <= (WIDTH_58MM_DOTS + 16)) WIDTH_58MM_DOTS else RECEIPT_80MM_WIDTH_DOTS
+        val escJob = EscPosEncoder.printBitmapJob(bitmap, rollWidth, threshold, autoCut)
         var printed = false
 
         Log.i(TAG, "sendBitmapToPrinterDirect: transport=$cleanTransport, format=$format, receiptAddr=$receiptAddr, labelAddr=$labelAddr, wifiHost=$wifiHost:$wifiPort")
@@ -441,7 +506,7 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
         }
     }
 
-    private fun cropAndScaleReceiptBitmap(src: Bitmap, targetWidth: Int = RECEIPT_80MM_WIDTH_DOTS): Bitmap {
+    private fun cropAndScaleReceiptBitmap(src: Bitmap, targetWidth: Int = RECEIPT_80MM_WIDTH_DOTS, encoderThreshold: Int): Bitmap {
         val w = src.width
         val h = src.height
 
@@ -455,7 +520,7 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 val g = Color.green(c)
                 val b = Color.blue(c)
                 val lum = (r * 30 + g * 59 + b * 11) / 100
-                if (lum < 235) {
+                if (lum < encoderThreshold) {
                     if (y < minY) minY = y
                     if (y > maxY) maxY = y
                 }

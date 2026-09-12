@@ -56,6 +56,122 @@ class BluetoothPrinterHub private constructor(private val context: Context) {
 
     private val connections = ConcurrentHashMap<String, Conn>()
 
+    // --- Auto-Reconnect Watchdog ---
+    private data class ReconnectTarget(
+        val role: String,
+        val address: String,
+        /** Backoff for NEXT failed reconnect. Start at 2s → max 60s (exponential). */
+        @Volatile var backoffMs: Long = 2000L,
+        /** Absolute epoch ms before which we skip attempting reconnect. */
+        @Volatile var nextRetryAtMs: Long = 0L
+    )
+    private val reconnectTargets = ConcurrentHashMap<String, ReconnectTarget>()
+    private val watchdogRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var watchdogThread: Thread? = null
+
+    private fun ensureWatchdog() {
+        if (watchdogRunning.getAndSet(true)) return
+        watchdogThread = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            Log.i(TAG, "Bluetooth watchdog started (20s NUL keep-alive + auto-reconnect)")
+            try {
+                while (watchdogRunning.get()) {
+                    try { Thread.sleep(20_000L) } catch (_: InterruptedException) { break }
+                    if (!watchdogRunning.get()) break
+
+                    val adapter = adapter
+                    val hasPerm = try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            androidx.core.content.ContextCompat.checkSelfPermission(
+                                context, android.Manifest.permission.BLUETOOTH_CONNECT
+                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        } else true
+                    } catch (_: Throwable) { true }
+                    if (adapter == null || !adapter.isEnabled || !hasPerm) {
+                        continue  // Skip this cycle if BT is off / missing permission
+                    }
+
+                    // ------------------------------------------------------------------
+                    // STEP A: NUL keep-alive ping — 1-byte ESC/POS 0x00 every 20s
+                    // Printers ignore NUL bytes but mark SPP socket as active →
+                    // prevents idle timeout close on budget thermal models.
+                    // ------------------------------------------------------------------
+                    val iterator = connections.entries.iterator()
+                    while (iterator.hasNext()) {
+                        val e = iterator.next()
+                        val role = e.key
+                        val conn = e.value
+                        if (conn.socket.isConnected) {
+                            try {
+                                conn.socket.outputStream.write(byteArrayOf(0x00))
+                                conn.socket.outputStream.flush()
+                            } catch (_: IOException) {
+                                Log.i(TAG, "Watchdog: NUL keep-alive failed for $role (${conn.name}). Socket dead. Will reconnect this cycle.")
+                                try { conn.socket.close() } catch (_: Exception) {}
+                                iterator.remove()
+                            }
+                        } else {
+                            try { conn.socket.close() } catch (_: Exception) {}
+                            iterator.remove()
+                        }
+                    }
+
+                    // ------------------------------------------------------------------
+                    // STEP B: Auto-reconnect with exponential backoff
+                    // ------------------------------------------------------------------
+                    val nowMs = System.currentTimeMillis()
+                    for ((role, target) in reconnectTargets) {
+                        if (isRoleConnected(role)) {
+                            if (target.backoffMs != 2000L || target.nextRetryAtMs != 0L) {
+                                target.backoffMs = 2000L
+                                target.nextRetryAtMs = 0L
+                            }
+                            continue
+                        }
+                        if (target.nextRetryAtMs > nowMs) {
+                            Log.d(TAG, "Watchdog: $role backoff active — retry in ${(target.nextRetryAtMs - nowMs)/1000}s")
+                            continue
+                        }
+                        Log.i(TAG, "Watchdog auto-reconnecting $role → ${target.address} (backoff=${target.backoffMs/1000}s)")
+                        val res = connect(role, target.address)
+                        if (res["ok"] == true) {
+                            target.backoffMs = 2000L
+                            target.nextRetryAtMs = 0L
+                            Log.i(TAG, "Watchdog reconnected $role successfully")
+                        } else {
+                            target.backoffMs = (target.backoffMs * 2L).coerceAtMost(60_000L)
+                            target.nextRetryAtMs = System.currentTimeMillis() + target.backoffMs
+                            Log.w(TAG, "Watchdog reconnect failed for $role. Next attempt in ${target.backoffMs/1000}s: ${res["error"]}")
+                        }
+                    }
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                watchdogRunning.set(false)
+                Log.i(TAG, "Bluetooth watchdog stopped")
+            }
+        }.apply { start() }
+    }
+
+    private fun registerForAutoReconnect(role: String, address: String) {
+        val existing = reconnectTargets[role]
+        if (existing != null && existing.address.equals(address, true)) {
+            existing.backoffMs = 2000L
+            existing.nextRetryAtMs = 0L
+            return
+        }
+        reconnectTargets[role] = ReconnectTarget(role = role, address = address)
+        ensureWatchdog()
+    }
+
+    fun stopWatchdog() {
+        watchdogRunning.set(false)
+        watchdogThread?.interrupt()
+        reconnectTargets.clear()
+    }
+    // -------------------------------
+
     fun isBluetoothAvailable(): Boolean = adapter != null
 
     fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
@@ -156,6 +272,7 @@ class BluetoothPrinterHub private constructor(private val context: Context) {
             }
             connections[normalized] = Conn(address, name, socket)
             Log.i(TAG, "Connected $normalized → $name ($address)")
+            registerForAutoReconnect(normalized, address)
             mapOf(
                 "ok" to true,
                 "role" to normalized,
@@ -197,6 +314,7 @@ class BluetoothPrinterHub private constructor(private val context: Context) {
             listOf(role.lowercase())
         }
         for (r in roles) {
+            reconnectTargets.remove(r)
             connections.remove(r)?.let { c ->
                 try {
                     c.socket.close()
