@@ -1242,11 +1242,12 @@ class MainActivity : FlutterActivity() {
             acceptJob(path, name ?: "Print job")
         }
 
-        // Website deep link: printfox://print?type=pdf&url=...&format=kot|bill
+        // Website deep link: fatfox://print?type=pdf&url=...&format=kot|bill
         val dataUri = intent.data
+        val scheme = dataUri?.scheme?.lowercase() ?: ""
         if (intent.action == Intent.ACTION_VIEW &&
             dataUri != null &&
-            dataUri.scheme.equals(DEEP_LINK_SCHEME, ignoreCase = true) &&
+            (scheme == "fatfox" || scheme == "printfox") &&
             dataUri.host.equals("print", ignoreCase = true)
         ) {
             moveTaskToBack(true)
@@ -1581,14 +1582,16 @@ class MainActivity : FlutterActivity() {
         Lp46PrintService.lastJobName = name
         deepLinkInProgress = false
         Log.i(TAG, "Print job ready ($pendingJobFormat, autoPrint=$isAutoPrint): $name → $path")
-        emitEvent(
-            mapOf(
-                "type" to "printJob",
-                "path" to path,
-                "name" to name,
-                "format" to pendingJobFormat
+        if (!isAutoPrint) {
+            emitEvent(
+                mapOf(
+                    "type" to "printJob",
+                    "path" to path,
+                    "name" to name,
+                    "format" to pendingJobFormat
+                )
             )
-        )
+        }
 
         if (isAutoPrint) {
             Log.i(TAG, "Executing silent background auto-print for $name")

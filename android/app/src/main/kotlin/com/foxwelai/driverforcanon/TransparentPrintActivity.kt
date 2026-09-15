@@ -109,7 +109,8 @@ class TransparentPrintActivity : Activity() {
         val dataString = intent.dataString ?: dataUri.toString()
         Log.i(TAG, "Transparent print deep link received: $dataString")
 
-        if (!dataUri.scheme.equals("printfox", ignoreCase = true) ||
+        val scheme = dataUri.scheme?.lowercase() ?: ""
+        if ((scheme != "fatfox" && scheme != "printfox") ||
             !dataUri.host.equals("print", ignoreCase = true)
         ) {
             safeFinish(0)
@@ -415,12 +416,13 @@ class TransparentPrintActivity : Activity() {
 
             var writeRes = btHub.write(targetRole, escJob)
             if (writeRes["ok"] != true) {
-                Log.w(TAG, "Write attempt 1 failed to $targetAddr: ${writeRes["error"]}. Retrying in 100ms...")
+                Log.w(TAG, "Write attempt 1 failed to $targetAddr: ${writeRes["error"]}. Reconnecting and retrying...")
                 try { Thread.sleep(100) } catch (_: Exception) {}
-                if (!btHub.isRoleConnected(targetRole)) {
-                    btHub.connect(targetRole, targetAddr)
+                btHub.disconnect(targetRole)
+                val connRes = btHub.connect(targetRole, targetAddr)
+                if (connRes["ok"] == true) {
+                    writeRes = btHub.write(targetRole, escJob)
                 }
-                writeRes = btHub.write(targetRole, escJob)
             }
 
             if (writeRes["ok"] == true) {
