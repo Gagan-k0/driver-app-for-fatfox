@@ -140,13 +140,14 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 }
             }
 
-            // CORS Preflight
+            // CORS Preflight & Private Network Access (PNA)
             if (requestLine.startsWith("OPTIONS")) {
                 out.print("HTTP/1.1 204 No Content\r\n")
                 out.print("Access-Control-Allow-Origin: *\r\n")
                 out.print("Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n")
                 out.print("Access-Control-Allow-Headers: Content-Type, Authorization, Access-Control-Request-Private-Network\r\n")
                 out.print("Access-Control-Allow-Private-Network: true\r\n")
+                out.print("Access-Control-Max-Age: 86400\r\n")
                 out.print("Connection: close\r\n\r\n")
                 out.flush()
                 socket.close()
@@ -217,6 +218,8 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 out.print("HTTP/1.1 200 OK\r\n")
                 out.print("Content-Type: application/json; charset=utf-8\r\n")
                 out.print("Access-Control-Allow-Origin: *\r\n")
+                out.print("Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n")
+                out.print("Access-Control-Allow-Headers: Content-Type, Authorization, Access-Control-Request-Private-Network\r\n")
                 out.print("Access-Control-Allow-Private-Network: true\r\n")
                 out.print("Content-Length: ${bytes.size}\r\n")
                 out.print("Connection: close\r\n\r\n")
@@ -229,6 +232,8 @@ class LocalHttpServer(private val context: Context, private val port: Int = 9123
                 out.print("HTTP/1.1 200 OK\r\n")
                 out.print("Content-Type: application/json; charset=utf-8\r\n")
                 out.print("Access-Control-Allow-Origin: *\r\n")
+                out.print("Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n")
+                out.print("Access-Control-Allow-Headers: Content-Type, Authorization, Access-Control-Request-Private-Network\r\n")
                 out.print("Access-Control-Allow-Private-Network: true\r\n")
                 out.print("Content-Length: ${bytes.size}\r\n")
                 out.print("Connection: close\r\n\r\n")

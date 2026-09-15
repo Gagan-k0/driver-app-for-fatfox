@@ -1310,15 +1310,8 @@ class MainActivity : FlutterActivity() {
         )
         pendingJobFormat = format
 
-        deepLinkInProgress = true
+        deepLinkInProgress = false
         lastDeepLinkError = null
-        emitEvent(
-            mapOf(
-                "type" to "deepLinkLoading",
-                "name" to (uri.getQueryParameter("name") ?: "Website print"),
-                "format" to format
-            )
-        )
 
         val type = (uri.getQueryParameter("type") ?: extractQueryParam(dataString, "type") ?: "pdf")
             .lowercase()
@@ -1575,20 +1568,23 @@ class MainActivity : FlutterActivity() {
         format: String = pendingJobFormat,
         isAutoPrint: Boolean = false
     ) {
-        pendingJobPath = path
-        pendingJobName = name
-        pendingJobFormat = normalizeFormat(format)
-        Lp46PrintService.lastJobPath = path
-        Lp46PrintService.lastJobName = name
+        val normFormat = normalizeFormat(format)
+        if (!isAutoPrint) {
+            pendingJobPath = path
+            pendingJobName = name
+            pendingJobFormat = normFormat
+            Lp46PrintService.lastJobPath = path
+            Lp46PrintService.lastJobName = name
+        }
         deepLinkInProgress = false
-        Log.i(TAG, "Print job ready ($pendingJobFormat, autoPrint=$isAutoPrint): $name → $path")
+        Log.i(TAG, "Print job ready ($normFormat, autoPrint=$isAutoPrint): $name → $path")
         if (!isAutoPrint) {
             emitEvent(
                 mapOf(
                     "type" to "printJob",
                     "path" to path,
                     "name" to name,
-                    "format" to pendingJobFormat
+                    "format" to normFormat
                 )
             )
         }
@@ -1603,7 +1599,7 @@ class MainActivity : FlutterActivity() {
                     val isPdf = path.lowercase().endsWith(".pdf")
                     val result = printJobFile(
                         path = path,
-                        format = pendingJobFormat,
+                        format = normFormat,
                         transport = preferredTransport,
                         threshold = threshold,
                         pageIndex = 0,
